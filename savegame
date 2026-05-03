@@ -1,0 +1,238 @@
+-- ChuScript SaveGame Module
+-- 保存当前游戏到本地 .rbxlx 文件
+
+local HttpService = game:GetService("HttpService")
+
+-- ── 工具函数 ─────────────────────────────────────────────────────────────────
+
+local function sanitizeXML(s)
+    -- 转义 XML 特殊字符
+    return tostring(s)
+        :gsub("&",  "&amp;")
+        :gsub("<",  "&lt;")
+        :gsub(">",  "&gt;")
+        :gsub('"',  "&quot;")
+        :gsub("'",  "&apos;")
+end
+
+-- 把 Color3 转成 R G B 三行（RBXLX 格式）
+local function encodeColor3(v)
+    return string.format(
+        "<R>%g</R><G>%g</G><B>%g</B>",
+        v.R, v.G, v.B
+    )
+end
+
+-- 把 Vector3 转成 X Y Z 三行
+local function encodeVector3(v)
+    return string.format(
+        "<X>%g</X><Y>%g</Y><Z>%g</Z>",
+        v.X, v.Y, v.Z
+    )
+end
+
+-- CFrame → 矩阵 12 个浮点数
+local function encodeCFrame(cf)
+    local c = {cf:GetComponents()}
+    return string.format(
+        "<X>%g</X><Y>%g</Y><Z>%g</Z>"..
+        "<R00>%g</R00><R01>%g</R01><R02>%g</R02>"..
+        "<R10>%g</R10><R11>%g</R11><R12>%g</R12>"..
+        "<R20>%g</R20><R21>%g</R21><R22>%g</R22>",
+        table.unpack(c)
+    )
+end
+
+-- ── 属性序列化 ────────────────────────────────────────────────────────────────
+
+-- 需要尝试读取的常见属性列表
+-- 按 ClassName 添加更多即可扩展
+local COMMON_PROPS = {
+    -- 基础
+    "Name", "Archivable",
+    -- BasePart
+    "Size", "Position", "CFrame", "Color", "Material",
+    "Transparency", "Reflectance", "CanCollide",
+    "Anchored", "Locked", "CastShadow",
+    -- Model
+    "PrimaryPart",
+    -- Script / LocalScript
+    "Source", "Disabled",
+    -- 灯光
+    "Brightness", "Range", "Angle", "Shadows",
+    -- GUI
+    "Text", "Font", "TextSize", "BackgroundColor3",
+    "TextColor3", "BorderSizePixel", "BackgroundTransparency",
+    "TextTransparency", "Visible", "ZIndex",
+    -- Sound
+    "SoundId", "Volume", "Pitch", "Looped", "PlayOnRemove",
+    -- Decal / Texture
+    "Texture", "Face",
+    -- SpecialMesh
+    "MeshId", "MeshType", "Scale",
+}
+
+local function encodeProperty(name, value)
+    local t = typeof(value)
+
+    if t == "string" then
+        return string.format(
+            '<string name="%s">%s</string>',
+            name, sanitizeXML(value)
+        )
+    elseif t == "boolean" then
+        return string.format(
+            '<bool name="%s">%s</bool>',
+            name, tostring(value)
+        )
+    elseif t == "number" then
+        -- 区分 int 和 float
+        if value == math.floor(value) and math.abs(value) < 2^31 then
+            return string.format('<int name="%s">%d</int>', name, value)
+        end
+        return string.format('<float name="%s">%g</float>', name, value)
+    elseif t == "Vector3" then
+        return string.format(
+            '<Vector3 name="%s">%s</Vector3>',
+            name, encodeVector3(value)
+        )
+    elseif t == "CFrame" then
+        return string.format(
+            '<CoordinateFrame name="%s">%s</CoordinateFrame>',
+            name, encodeCFrame(value)
+        )
+    elseif t == "Color3" then
+        return string.format(
+            '<Color3 name="%s">%s</Color3>',
+            name, encodeColor3(value)
+        )
+    elseif t == "BrickColor" then
+        return string.format(
+            '<BrickColor name="%s"><Value>%d</Value></BrickColor>',
+            name, value.Number
+        )
+    elseif t == "EnumItem" then
+        return string.format(
+            '<token name="%s">%d</token>',
+            name, value.Value
+        )
+    elseif t == "Vector2" then
+        return string.format(
+            '<Vector2 name="%s"><X>%g</X><Y>%g</Y></Vector2>',
+            name, value.X, value.Y
+        )
+    elseif t == "UDim2" then
+        return string.format(
+            '<UDim2 name="%s">'..
+            '<XS>%g</XS><XO>%d</XO>'..
+            '<YS>%g</YS><YO>%d</YO>'..
+            '</UDim2>',
+            name,
+            value.X.Scale, value.X.Offset,
+            value.Y.Scale, value.Y.Offset
+        )
+    end
+    -- 类型不支持 → 跳过
+    return nil
+end
+
+-- ── 递归序列化 Instance ────────────────────────────────────────────────────────
+
+local function serializeInstance(inst, depth)
+    depth = depth or 0
+    local indent = string.rep("\t", depth)
+
+    -- 跳过不可归档的对象（灯光、摄像机等可选）
+    if not inst.Archivable then return "" end
+
+    local lines = {}
+
+    -- 开头标签
+    table.insert(lines, string.format(
+        '%s<Item class="%s" referent="RBX%p">',
+        indent, sanitizeXML(inst.ClassName), inst
+    ))
+    table.insert(lines, indent .. "\t<Properties>")
+
+    -- 属性
+    for _, propName in ipairs(COMMON_PROPS) do
+        local ok, value = pcall(function()
+            return (inst :: any)[propName]
+        end)
+        if ok and value ~= nil then
+            local encoded = encodeProperty(propName, value)
+            if encoded then
+                table.insert(lines,
+                    indent .. "\t\t" .. encoded
+                )
+            end
+        end
+    end
+
+    table.insert(lines, indent .. "\t</Properties>")
+
+    -- 递归子对象
+    for _, child in ipairs(inst:GetChildren()) do
+        local childXml = serializeInstance(child, depth + 1)
+        if childXml ~= "" then
+            table.insert(lines, childXml)
+        end
+    end
+
+    -- 结尾标签
+    table.insert(lines, indent .. "</Item>")
+
+    return table.concat(lines, "\n")
+end
+
+-- ── 主函数 ────────────────────────────────────────────────────────────────────
+
+local function saveGame(targets, fileName)
+    -- targets: Instance 数组，默认保存 Workspace
+    targets  = targets  or {workspace}
+    fileName = fileName or ("SavedGame_" .. os.time() .. ".rbxlx")
+
+    -- RBXLX 文件头
+    local parts = {
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime"',
+        '        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"',
+        '        xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd"',
+        '        version="4">',
+        "\t<External>null</External>",
+        "\t<External>nil</External>",
+    }
+
+    -- 序列化每个目标
+    for _, target in ipairs(targets) do
+        local xml = serializeInstance(target, 1)
+        if xml ~= "" then
+            table.insert(parts, xml)
+        end
+    end
+
+    table.insert(parts, "</roblox>")
+
+    local fullXml = table.concat(parts, "\n")
+
+    -- 写文件（executor workspace 文件夹）
+    local ok, err = pcall(writefile, fileName, fullXml)
+    if ok then
+        print("[ChuScript] 已保存 → " .. fileName)
+    else
+        warn("[ChuScript] 保存失败：" .. tostring(err))
+    end
+
+    return ok
+end
+
+-- ── 示例用法 ──────────────────────────────────────────────────────────────────
+
+-- 保存整个 Workspace
+saveGame({workspace}, "workspace_save.rbxlx")
+
+-- 只保存某个 Model
+-- saveGame({workspace.SomeModel}, "model_save.rbxlx")
+
+-- 保存多个服务
+-- saveGame({workspace, game:GetService("ReplicatedStorage")}, "full_save.rbxlx")

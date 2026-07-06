@@ -46,7 +46,7 @@ function CommandLoaderService:loadDirectory(csInstance, folder)
       end)
 
       if success then
-        loadedCount += 1
+        loadedCount = loadedCount + 1
         self._logger:debug(string.format("Loaded command module: %s", module.Name))
       else
         self._logger:error(string.format("Failed to load command module '%s': %s", module.Name, tostring(result)))

@@ -5,103 +5,168 @@
 ]]
 
 local Players = game:GetService("Players")
-local Workspace = game:GetService("Workspace")
+
+local function parseNumber(value, fallback)
+  if value == nil or value == "" then
+    return fallback
+  end
+
+  local number = tonumber(value)
+  return number or nil
+end
+
+local function parseToggle(value)
+  if value == nil or value == "" then
+    return nil
+  end
+
+  local normalized = string.lower(value)
+  if normalized == "on" or normalized == "true" or normalized == "1" then
+    return true
+  elseif normalized == "off" or normalized == "false" or normalized == "0" then
+    return false
+  end
+
+  return nil
+end
 
 return function(cs)
   local playerService = cs.players
   local utilityService = cs.utility
 
-  -- 1. Fly 命令
-  cs:registerCommand("fly", {"f"}, "开启/关闭本地飞行", function(args)
+  local function applyToTargets(selector, callback)
+    local targets = playerService:getTargets(selector or "me")
+    if #targets == 0 then
+      return false, "No valid targets found."
+    end
+
+    for _, player in ipairs(targets) do
+      callback(player)
+    end
+
+    return true, string.format("Applied to %d player(s).", #targets)
+  end
+
+  cs:registerCommand("fly", {"f"}, "开启/关闭或设置飞行速度", function(args)
     local targets = playerService:getTargets(args[1] or "me")
-    local speed = tonumber(args[2]) or 50
+    if #targets == 0 then
+      return false, "No valid targets found."
+    end
 
-    if #targets == 0 then return false, "No valid targets found." end
+    local speedArg = args[2]
+    local speed = parseNumber(speedArg, 50)
+    local toggle = parseToggle(speedArg)
 
-    for _, p in ipairs(targets) do
-      if utilityService._flyConnections[p] then
-        utilityService:stopFly(p)
+    for _, target in ipairs(targets) do
+      if toggle == false then
+        utilityService:stopFly(target)
+      elseif toggle == true then
+        utilityService:startFly(target, speed or 50)
+      elseif utilityService._flyConnections[target] then
+        utilityService:stopFly(target)
       else
-        utilityService:startFly(p, speed)
+        utilityService:startFly(target, speed or 50)
       end
     end
+
     return true, "Toggled fly for " .. #targets .. " player(s)."
   end)
 
-  -- 2. Noclip 命令
-  cs:registerCommand("noclip", {"nc"}, "开启/关闭本地穿墙", function(args)
+  cs:registerCommand("noclip", {"nc"}, "开启/关闭穿墙", function(args)
     local targets = playerService:getTargets(args[1] or "me")
+    if #targets == 0 then
+      return false, "No valid targets found."
+    end
 
-    for _, p in ipairs(targets) do
-      if utilityService._noclipConnections[p] then
-        utilityService:stopNoclip(p)
+    for _, target in ipairs(targets) do
+      if utilityService._noclipConnections[target] then
+        utilityService:stopNoclip(target)
       else
-        utilityService:startNoclip(p)
+        utilityService:startNoclip(target)
       end
     end
+
     return true, "Toggled noclip for " .. #targets .. " player(s)."
   end)
 
-  -- 3. WalkSpeed 命令
-  cs:registerCommand("walkspeed", {"ws", "speed"}, "修改本地移动速度", function(args)
+  cs:registerCommand("walkspeed", {"ws", "speed"}, "修改移动速度", function(args)
     local targets = playerService:getTargets(args[1] or "me")
-    local speed = tonumber(args[2]) or 16
+    if #targets == 0 then
+      return false, "No valid targets found."
+    end
 
-    for _, p in ipairs(targets) do
-      local char = p.Character
-      local hum = char and char:FindFirstChildOfClass("Humanoid")
-      if hum then
-        hum.WalkSpeed = speed
+    local speed = parseNumber(args[2], 16)
+    if speed == nil then
+      return false, "Invalid speed value."
+    end
+
+    for _, target in ipairs(targets) do
+      local character = target.Character
+      local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+      if humanoid then
+        humanoid.WalkSpeed = speed
       end
     end
+
     return true, string.format("Set WalkSpeed to %d for %d player(s).", speed, #targets)
   end)
 
-  -- 4. JumpPower 命令
-  cs:registerCommand("jumppower", {"jp"}, "修改本地跳跃力", function(args)
+  cs:registerCommand("jumppower", {"jp"}, "修改跳跃力", function(args)
     local targets = playerService:getTargets(args[1] or "me")
-    local power = tonumber(args[2]) or 50
+    if #targets == 0 then
+      return false, "No valid targets found."
+    end
 
-    for _, p in ipairs(targets) do
-      local char = p.Character
-      local hum = char and char:FindFirstChildOfClass("Humanoid")
-      if hum then
-        hum.UseJumpPower = true
-        hum.JumpPower = power
+    local power = parseNumber(args[2], 50)
+    if power == nil then
+      return false, "Invalid jump power value."
+    end
+
+    for _, target in ipairs(targets) do
+      local character = target.Character
+      local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+      if humanoid then
+        humanoid.UseJumpPower = true
+        humanoid.JumpPower = power
       end
     end
+
     return true, string.format("Set JumpPower to %d for %d player(s).", power, #targets)
   end)
 
-  -- 5. Goto 命令 (传送到某人身边)
   cs:registerCommand("goto", {"to"}, "传送到指定玩家身边", function(args)
     local targets = playerService:getTargets(args[1] or "")
-    if #targets == 0 then return false, "No target found to goto." end
+    if #targets == 0 then
+      return false, "No target found to goto."
+    end
 
-    local targetChar = targets[1].Character
-    local targetRoot = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
+    local targetCharacter = targets[1].Character
+    local targetRoot = targetCharacter and targetCharacter:FindFirstChild("HumanoidRootPart")
     local localRoot = Players.LocalPlayer.Character and Players.LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
 
     if targetRoot and localRoot then
       localRoot.CFrame = targetRoot.CFrame * CFrame.new(0, 0, 3)
       return true, "Teleported to " .. targets[1].Name
     end
+
     return false, "Failed to get HumanoidRootPart."
   end)
 
-  -- 6. TP 命令 (传送至坐标)
   cs:registerCommand("teleport", {"tp"}, "传送到指定坐标 (x y z)", function(args)
-    local x = tonumber(args[1])
-    local y = tonumber(args[2])
-    local z = tonumber(args[3])
+    local x = parseNumber(args[1], nil)
+    local y = parseNumber(args[2], nil)
+    local z = parseNumber(args[3], nil)
 
-    if not x or not y or not z then return false, "Invalid coordinates. Usage: tp <x> <y> <z>" end
+    if not x or not y or not z then
+      return false, "Invalid coordinates. Usage: tp <x> <y> <z>"
+    end
 
     local localRoot = Players.LocalPlayer.Character and Players.LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
     if localRoot then
       localRoot.CFrame = CFrame.new(x, y, z)
       return true, string.format("Teleported to %d, %d, %d", x, y, z)
     end
+
     return false, "Local character not found."
   end)
 end

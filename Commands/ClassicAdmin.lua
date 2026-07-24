@@ -1,154 +1,113 @@
+--!strict
 --[[
   Module: ClassicAdminCommands
-  Description: 参考 IY / CMD-X 风格扩展的常用管理员命令。
+  Description: god / invis / visible / explode / reset / kick。
 ]]
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 
-local function getHumanoid(player)
-  local character = player and player.Character
-  if not character then
-    return nil
-  end
+return function(cs: any)
+	local players = cs.players
+	if not players then
+		cs.logger:error("ClassicAdminCommands: cs.players missing")
+		return
+	end
 
-  return character:FindFirstChildOfClass("Humanoid")
-end
+	local Common = require(script.Parent._Common)
 
-local function getRoot(player)
-  local character = player and player.Character
-  if not character then
-    return nil
-  end
+	local godStates: { [Player]: { maxHealth: number, health: number } } = {}
+	local invisStates: { [Player]: { [BasePart]: number } } = {}
 
-  return character:FindFirstChild("HumanoidRootPart")
-end
+	local function apply(selector, callback)
+		return Common.applyToTargets(players, selector, false, callback)
+	end
 
-return function(cs)
-  local playerService = cs.players
+	cs:registerCommand("god", {"godmode"}, "Toggle god mode.", function(args)
+		return apply(args[1], function(player)
+			local hum = Common.getHumanoid(player)
+			if not hum then return end
+			local stored = godStates[player]
+			if stored then
+				hum.MaxHealth = math.max(stored.maxHealth, 1)
+				hum.Health = math.min(stored.health, hum.MaxHealth)
+				godStates[player] = nil
+			else
+				godStates[player] = { maxHealth = hum.MaxHealth, health = hum.Health }
+				hum.MaxHealth = 100000000
+				hum.Health = 100000000
+			end
+		end)
+	end)
 
-  local godStates = {}
-  local invisibilityStates = {}
+	cs:registerCommand("invis", {"invisible", "ghost"}, "Toggle invisibility.", function(args)
+		return apply(args[1], function(player)
+			local char = player and player.Character
+			if not char then return end
+			local stored = invisStates[player]
+			if stored then
+				for part, original in pairs(stored) do
+					if part and part.Parent then part.Transparency = original end
+				end
+				invisStates[player] = nil
+			else
+				local records: { [BasePart]: number } = {}
+				for _, descendant in ipairs(char:GetDescendants()) do
+					if descendant:IsA("BasePart") then
+						records[descendant] = descendant.Transparency
+						descendant.Transparency = 1
+					end
+				end
+				invisStates[player] = records
+			end
+		end)
+	end)
 
-  local function applyToTargets(selector, callback)
-    local targets = playerService:getTargets(selector or "me")
-    if #targets == 0 then
-      return false, "No valid targets found."
-    end
+	cs:registerCommand("visible", {"vis"}, "Restore visibility.", function(args)
+		return apply(args[1], function(player)
+			local records = invisStates[player]
+			if not records then return end
+			for part, original in pairs(records) do
+				if part and part.Parent then part.Transparency = original end
+			end
+			invisStates[player] = nil
+		end)
+	end)
 
-    for _, player in ipairs(targets) do
-      callback(player)
-    end
+	cs:registerCommand("explode", {"boom"}, "Explode target.", function(args)
+		return apply(args[1], function(player)
+			local root = Common.getRoot(player)
+			if not root then return end
+			local ex = Instance.new("Explosion")
+			ex.Position = root.Position
+			ex.BlastRadius = 8
+			ex.BlastPressure = 0
+			ex.DestroyJointRadiusPercent = 0
+			ex.Parent = Workspace
+		end)
+	end)
 
-    return true, string.format("Applied to %d player(s).", #targets)
-  end
+	cs:registerCommand("reset", {"rejoin"}, "Reset character.", function(args)
+		return apply(args[1], function(player)
+			if player and player.Parent then player:LoadCharacter() end
+		end)
+	end)
 
-  cs:registerCommand("god", {"godmode"}, "开启/关闭无敌模式", function(args)
-    return applyToTargets(args[1] or "me", function(player)
-      local humanoid = getHumanoid(player)
-      if not humanoid then
-        return
-      end
+	cs:registerCommand("kick", {}, "Kick target (client-side, skip self).", function(args)
+		local targets = players:getTargets(args[1] or "me")
+		if #targets == 0 then return false, "No valid targets found." end
 
-      if godStates[player] then
-        humanoid.MaxHealth = godStates[player].maxHealth
-        humanoid.Health = godStates[player].health
-        godStates[player] = nil
-      else
-        godStates[player] = {
-          maxHealth = humanoid.MaxHealth,
-          health = humanoid.Health,
-        }
-        humanoid.MaxHealth = 100000000
-        humanoid.Health = 100000000
-      end
-    end)
-  end)
+		local reason = table.concat(args, " ", 2)
+		if reason == "" then reason = "Kicked by admin" end
 
-  cs:registerCommand("invis", {"invisible", "ghost"}, "开启/关闭隐身", function(args)
-    return applyToTargets(args[1] or "me", function(player)
-      local character = player and player.Character
-      if not character then
-        return
-      end
+		local kicked = 0
+		for _, player in ipairs(targets) do
+			if player ~= Players.LocalPlayer then
+				local ok = pcall(function() player:Kick(reason) end)
+				if ok then kicked += 1 end
+			end
+		end
 
-      if invisibilityStates[player] then
-        for part, originalTransparency in pairs(invisibilityStates[player]) do
-          if part and part.Parent then
-            part.Transparency = originalTransparency
-          end
-        end
-        invisibilityStates[player] = nil
-      else
-        local records = {}
-        for _, descendant in ipairs(character:GetDescendants()) do
-          if descendant:IsA("BasePart") then
-            records[descendant] = descendant.Transparency
-            descendant.Transparency = 1
-          end
-        end
-        invisibilityStates[player] = records
-      end
-    end)
-  end)
-
-  cs:registerCommand("visible", {"vis"}, "解除隐身", function(args)
-    return applyToTargets(args[1] or "me", function(player)
-      local records = invisibilityStates[player]
-      if not records then
-        return
-      end
-
-      for part, originalTransparency in pairs(records) do
-        if part and part.Parent then
-          part.Transparency = originalTransparency
-        end
-      end
-      invisibilityStates[player] = nil
-    end)
-  end)
-
-  cs:registerCommand("explode", {"boom"}, "让目标角色爆炸", function(args)
-    return applyToTargets(args[1] or "me", function(player)
-      local root = getRoot(player)
-      if not root then
-        return
-      end
-
-      local explosion = Instance.new("Explosion")
-      explosion.Position = root.Position
-      explosion.BlastRadius = 8
-      explosion.BlastPressure = 0
-      explosion.DestroyJointRadiusPercent = 0
-      explosion.Parent = Workspace
-    end)
-  end)
-
-  cs:registerCommand("reset", {"rejoin"}, "重置目标角色", function(args)
-    return applyToTargets(args[1] or "me", function(player)
-      if player and player.Parent then
-        player:LoadCharacter()
-      end
-    end)
-  end)
-
-  cs:registerCommand("kick", {}, "将目标踢出游戏", function(args)
-    local targets = playerService:getTargets(args[1] or "me")
-    if #targets == 0 then
-      return false, "No valid targets found."
-    end
-
-    local reason = table.concat(args, " ", 2)
-    if reason == "" then
-      reason = "Kicked by admin"
-    end
-
-    for _, player in ipairs(targets) do
-      if player ~= Players.LocalPlayer then
-        player:Kick(reason)
-      end
-    end
-
-    return true, string.format("Kicked %d player(s).", #targets)
-  end)
+		return true, ("Kicked %d player(s)."):format(kicked)
+	end)
 end

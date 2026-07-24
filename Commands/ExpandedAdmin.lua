@@ -1,168 +1,145 @@
+--!strict
 --[[
   Module: ExpandedAdminCommands
-  Description: 进一步扩展的管理员命令，覆盖工具、传送和状态控制。
+  Description: 工具栏、传送、状态控制。
 ]]
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
 
-local function getHumanoid(player)
-  local character = player and player.Character
-  if not character then
-    return nil
-  end
+return function(cs: any)
+	local players = cs.players
+	if not players then
+		cs.logger:error("ExpandedAdminCommands: cs.players missing")
+		return
+	end
 
-  return character:FindFirstChildOfClass("Humanoid")
-end
+	local Common = require(script.Parent._Common)
 
-local function getRoot(player)
-  local character = player and player.Character
-  if not character then
-    return nil
-  end
+	local spinStates: { [Player]: { conn: RBXScriptConnection } } = {}
 
-  return character:FindFirstChild("HumanoidRootPart")
-end
+	local function apply(selector, callback)
+		return Common.applyToTargets(players, selector, false, callback)
+	end
 
-return function(cs)
-  local playerService = cs.players
+	local function stopSpin(player)
+		local s = spinStates[player]
+		if s then
+			s.conn:Disconnect()
+			spinStates[player] = nil
+		end
+	end
 
-  local function applyToTargets(selector, callback)
-    local targets = playerService:getTargets(selector or "me")
-    if #targets == 0 then
-      return false, "No valid targets found."
-    end
+	Players.PlayerRemoving:Connect(stopSpin)
 
-    for _, player in ipairs(targets) do
-      callback(player)
-    end
+	cs:registerCommand("tool", {"giveweapon", "giveitem"}, "Give a tool by name.", function(args)
+		local targets = players:getTargets(args[1] or "me")
+		if #targets == 0 then return false, "No valid targets found." end
+		local toolName = args[2]
+		if not toolName or toolName == "" then return false, "Usage: tool <player> <toolName>" end
 
-    return true, string.format("Applied to %d player(s).", #targets)
-  end
+		local tool = ReplicatedStorage:FindFirstChild(toolName) or Workspace:FindFirstChild(toolName)
+		if not tool then return false, ("Tool '%s' not found."):format(toolName) end
 
-  cs:registerCommand("tool", {"giveweapon", "giveitem"}, "给目标玩家一个工具", function(args)
-    local targets = playerService:getTargets(args[1] or "me")
-    if #targets == 0 then
-      return false, "No valid targets found."
-    end
+		for _, player in ipairs(targets) do
+			local char = player.Character
+			if char then
+				local clone = tool:Clone()
+				clone.Parent = char
+			end
+		end
+		return true, ("Gave '%s' to %d player(s)."):format(toolName, #targets)
+	end)
 
-    local toolName = args[2]
-    if not toolName or toolName == "" then
-      return false, "Usage: tool <player> <toolName>"
-    end
+	cs:registerCommand("removeTool", {"rmtool"}, "Remove a tool by name.", function(args)
+		local targets = players:getTargets(args[1] or "me")
+		if #targets == 0 then return false, "No valid targets found." end
+		local toolName = args[2]
+		if not toolName or toolName == "" then return false, "Usage: removeTool <player> <toolName>" end
 
-    local tool = ReplicatedStorage:FindFirstChild(toolName) or Workspace:FindFirstChild(toolName)
-    if not tool then
-      return false, string.format("Tool '%s' not found.", toolName)
-    end
+		for _, player in ipairs(targets) do
+			local char = player.Character
+			if char then
+				local found = char:FindFirstChild(toolName)
+				if found then found:Destroy() end
+			end
+		end
+		return true, ("Removed tool '%s' from %d player(s)."):format(toolName, #targets)
+	end)
 
-    for _, player in ipairs(targets) do
-      local character = player.Character
-      if character then
-        local clone = tool:Clone()
-        clone.Parent = character
-      end
-    end
+	cs:registerCommand("tpall", {"bringall"}, "Bring all players to you.", function()
+		local localRoot = Common.getRoot(Players.LocalPlayer)
+		if not localRoot then return false, "Local character not found." end
 
-    return true, string.format("Gave '%s' to %d player(s).", toolName, #targets)
-  end)
+		local count = 0
+		for _, player in ipairs(Players:GetPlayers()) do
+			if player ~= Players.LocalPlayer then
+				local root = Common.getRoot(player)
+				if root then
+					root.CFrame = localRoot.CFrame * CFrame.new(0, 0, -3)
+					count += 1
+				end
+			end
+		end
+		return true, ("Brought %d player(s) to you."):format(count)
+	end)
 
-  cs:registerCommand("removeTool", {"rmtool"}, "移除目标玩家身上的工具", function(args)
-    local targets = playerService:getTargets(args[1] or "me")
-    if #targets == 0 then
-      return false, "No valid targets found."
-    end
+	cs:registerCommand("spin", {}, "Toggle spin on target.", function(args)
+		return apply(args[1], function(player)
+			if spinStates[player] then
+				stopSpin(player)
+				return
+			end
+			local root = Common.getRoot(player)
+			if not root then return end
+			local conn = RunService.RenderStepped:Connect(function()
+				if not root.Parent or not Common.isAlive(player) then
+					stopSpin(player)
+					return
+				end
+				root.CFrame = root.CFrame * CFrame.Angles(0, math.rad(15), 0)
+			end)
+			spinStates[player] = { conn = conn }
+		end)
+	end)
 
-    local toolName = args[2]
-    if not toolName or toolName == "" then
-      return false, "Usage: removeTool <player> <toolName>"
-    end
+	cs:registerCommand("ragdoll", {}, "Ragdoll target.", function(args)
+		return apply(args[1], function(player)
+			local hum = Common.getHumanoid(player)
+			if hum then
+				hum.PlatformStand = true
+				hum.WalkSpeed = 0
+			end
+		end)
+	end)
 
-    for _, player in ipairs(targets) do
-      local character = player.Character
-      if character then
-        local tool = character:FindFirstChild(toolName)
-        if tool then
-          tool:Destroy()
-        end
-      end
-    end
+	cs:registerCommand("unragdoll", {}, "Unragdoll target.", function(args)
+		return apply(args[1], function(player)
+			local hum = Common.getHumanoid(player)
+			if hum then
+				hum.PlatformStand = false
+				hum.WalkSpeed = 16
+			end
+		end)
+	end)
 
-    return true, string.format("Removed tool '%s' from %d player(s).", toolName, #targets)
-  end)
+	cs:registerCommand("sethealth", {"health"}, "Set target's health.", function(args)
+		local targets = players:getTargets(args[1] or "me")
+		if #targets == 0 then return false, "No valid targets found." end
 
-  cs:registerCommand("tpall", {"bringall"}, "把所有玩家传送到你这里", function(args)
-    local localRoot = getRoot(Players.LocalPlayer)
-    if not localRoot then
-      return false, "Local character not found."
-    end
+		local value = Common.parseNumber(args[2], nil)
+		if value == nil then return false, "Usage: sethealth <player> <number>" end
+		value = math.clamp(value, 0, 1e9)
 
-    for _, player in ipairs(Players:GetPlayers()) do
-      if player ~= Players.LocalPlayer then
-        local targetRoot = getRoot(player)
-        if targetRoot then
-          targetRoot.CFrame = localRoot.CFrame * CFrame.new(0, 0, -3)
-        end
-      end
-    end
-
-    return true, "Brought all players to you."
-  end)
-
-  cs:registerCommand("spin", {}, "让目标角色旋转", function(args)
-    return applyToTargets(args[1] or "me", function(player)
-      local root = getRoot(player)
-      if not root then
-        return
-      end
-
-      local connection
-      connection = game:GetService("RunService").RenderStepped:Connect(function()
-        if root and root.Parent then
-          root.CFrame = root.CFrame * CFrame.Angles(0, math.rad(15), 0)
-        else
-          connection:Disconnect()
-        end
-      end)
-    end)
-  end)
-
-  cs:registerCommand("ragdoll", {}, "让目标角色进入摔倒状态", function(args)
-    return applyToTargets(args[1] or "me", function(player)
-      local humanoid = getHumanoid(player)
-      if humanoid then
-        humanoid.PlatformStand = true
-        humanoid.WalkSpeed = 0
-      end
-    end)
-  end)
-
-  cs:registerCommand("unragdoll", {}, "解除摔倒状态", function(args)
-    return applyToTargets(args[1] or "me", function(player)
-      local humanoid = getHumanoid(player)
-      if humanoid then
-        humanoid.PlatformStand = false
-        humanoid.WalkSpeed = 16
-      end
-    end)
-  end)
-
-  cs:registerCommand("sethealth", {"health"}, "设置目标生命值", function(args)
-    local targets = playerService:getTargets(args[1] or "me")
-    if #targets == 0 then
-      return false, "No valid targets found."
-    end
-
-    local health = tonumber(args[2]) or 100
-    for _, player in ipairs(targets) do
-      local humanoid = getHumanoid(player)
-      if humanoid then
-        humanoid.Health = health
-        humanoid.MaxHealth = math.max(health, humanoid.MaxHealth)
-      end
-    end
-
-    return true, string.format("Set health to %d for %d player(s).", health, #targets)
-  end)
+		for _, player in ipairs(targets) do
+			local hum = Common.getHumanoid(player)
+			if hum then
+				hum.MaxHealth = math.max(value, hum.MaxHealth)
+				hum.Health = value
+			end
+		end
+		return true, ("Set health to %d for %d player(s)."):format(value, #targets)
+	end)
 end

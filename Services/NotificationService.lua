@@ -1,65 +1,71 @@
+--!strict
 --[[
   Module: NotificationService
-  Description: 通知管理服务。接管所有系统消息的 UI 展示。
-  Part of: ChuScript Microservices Architecture
+  Description: 通知聚合服务。把 CommandProcessed / SystemError 转为可视化通知。
 ]]
 
 local Players = game:GetService("Players")
+local MessageBus = require(script.Parent.Core.MessageBus)
+local LoggerService = require(script.Parent.Services.LoggerService)
 local NotificationUI = require(script.Parent.Parent.Packages.UI.Notification)
 
 local NotificationService = {}
 NotificationService.__index = NotificationService
 
---- 构造函数（依赖注入）。
--- @param messageBus MessageBus
--- @param loggerService LoggerService
--- @return NotificationService
-function NotificationService.new(messageBus, loggerService)
-  local self = setmetatable({}, NotificationService)
-  self._bus = messageBus
-  self._logger = loggerService
+export type NotificationType = "Info" | "Success" | "Warn" | "Error"
 
-  self._playerGui = Players.LocalPlayer:WaitForChild("PlayerGui")
+function NotificationService.new(messageBus: MessageBus.MessageBus, loggerService: LoggerService.LoggerService)
+	assert(messageBus and loggerService, "Missing dependencies")
 
-  -- 独立创建一个 ScreenGui 容器，确保通知永远在最上层
-  self._screenGui = Instance.new("ScreenGui")
-  self._screenGui.Name = "ChuScriptNotifications"
-  self._screenGui.ResetOnSpawn = false
-  self._screenGui.DisplayOrder = 100 -- 高于主 UI
-  self._screenGui.Parent = self._playerGui
+	local self = setmetatable({}, NotificationService)
+	self._bus = messageBus
+	self._logger = loggerService
 
-  self._ui = NotificationUI.new(self._screenGui)
+	local playerGui = Players.LocalPlayer:WaitForChild("PlayerGui")
+	self._screenGui = Instance.new("ScreenGui")
+	self._screenGui.Name = "ChuScriptNotifications"
+	self._screenGui.ResetOnSpawn = false
+	self._screenGui.DisplayOrder = 100
+	self._screenGui.IgnoreGuiInset = true
+	self._screenGui.Enabled = true
+	self._screenGui.Parent = playerGui
 
-  self:_bindSystemEvents()
-  self._logger:info("NotificationService initialized")
-  return self
+	self._ui = NotificationUI.new(self._screenGui)
+	self._bindings = {}
+
+	self:_bindSystemEvents()
+	self._logger:info("NotificationService initialized")
+	return self
 end
 
---- 绑定系统微服务事件，自动触发通知。
 function NotificationService:_bindSystemEvents()
-  -- 监听命令处理结果
-  self._bus:subscribe("CommandProcessed", function(data)
-    if data.success then
-      self:Send("Command Executed", data.message, 3, "Success")
-    else
-      -- 错误消息可能包含建议，给予更长的显示时间
-      self:Send("Command Failed", data.message, 5, "Error")
-    end
-  end)
+	self._bindings.command = self._bus:subscribe("CommandProcessed", function(data: { success: boolean, message: string })
+		if type(data) ~= "table" then return end
+		local title, kind, duration = "Command Executed", "Success", 3
+		if not data.success then
+			title, kind, duration = "Command Failed", "Error", 5
+		end
+		self:Send(title, tostring(data.message or ""), duration, kind)
+	end)
 
-  -- 监听系统级崩溃
-  self._bus:subscribe("SystemError", function(data)
-    self:Send("System Error", data.message, 7, "Error")
-  end)
+	self._bindings.error = self._bus:subscribe("SystemError", function(data)
+		if type(data) ~= "table" then return end
+		local msg = if type(data.message) == "string" then data.message else "(no message)"
+		self:Send("System Error", msg, 7, "Error")
+	end)
 end
 
---- 公共 API：发送一条通知。
--- @param title string
--- @param message string
--- @param duration number
--- @param notifType string "Info", "Success", "Warn", "Error"
-function NotificationService:Send(title, message, duration, notifType)
-  self._ui:Push(title, message, duration, notifType)
+function NotificationService:Send(title: string, message: string, duration: number?, notifType: NotificationType?)
+	self._ui:Push(title, message, duration or 3, notifType or "Info")
 end
 
-return NotificationService
+function NotificationService:destroy()
+	for _, token in pairs(self._bindings) do
+		self._bus:unsubscribe(token)
+	end
+	if self._screenGui and self._screenGui.Parent then
+		self._screenGui:Destroy()
+	end
+end
+
+return table.freeze(NotificationService)

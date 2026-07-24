@@ -1,128 +1,143 @@
+--!strict
 --[[
   Module: ConfigService
-  Description: 运行时配置管理服务，支持本地文件持久化。
-  Part of: ChuScript Microservices Architecture
+  Description: 运行时配置 + 本地文件持久化。真正的单次延迟防抖,可动态修改合并。
 ]]
 
 local HttpService = game:GetService("HttpService")
+local MessageBus = require(script.Parent.Core.MessageBus)
+local LoggerService = require(script.Parent.Services.LoggerService)
 
 local ConfigService = {}
 ConfigService.__index = ConfigService
 
-local kConfigPath = "ChuScript/config.json"
-local kDebounceTime = 2 -- 写入防抖时间(秒)，避免频繁修改导致IO卡顿
+local CONFIG_DIR = "ChuScript"
+local CONFIG_FILE = "ChuScript/config.json"
+local DEBOUNCE_SECONDS = 2
 
-local kDefaultConfig = {
-  prefix = ":",
-  fuzzyMatchThreshold = 0.6,
-  autoExecuteOnFuzzyMatch = false,
-  theme = "Dark"
+local DEFAULT_CONFIG = {
+	prefix = ":",
+	fuzzyMatchThreshold = 0.6,
+	autoExecuteOnFuzzyMatch = false,
+	theme = "Dark",
 }
 
---- 构造函数。
--- @param messageBus MessageBus
--- @return ConfigService
-function ConfigService.new(messageBus)
-  local self = setmetatable({}, ConfigService)
-  self._bus = messageBus
-  self._data = {}
-  self._savePending = false
-  self._lastSaveTime = 0
+function ConfigService.new(messageBus: MessageBus.MessageBus, loggerService: LoggerService.LoggerService)
+	assert(messageBus, "ConfigService requires MessageBus")
+	local self = setmetatable({}, ConfigService)
+	self._bus = messageBus
+	self._logger = loggerService
+	self._data = {} :: { [string]: any }
 
-  -- 探测文件系统支持
-  self._fsSupported = (readfile and writefile and isfile and isfolder and makefolder) ~= nil
+	-- 是否支持文件 IO(标志合并,避免反复访问全局)
+	local fs = readfile and writefile and isfile and isfolder and makefolder
+	self._fsSupported = fs and true or false
 
-  self:_loadFromFile()
-  
-  return self
+	self:_loadFromFile()
+	self._logger:info("ConfigService initialized")
+	return self
 end
 
---- 从文件加载配置，合并默认值。
+--- 合并默认值,然后叠加磁盘内容。
 function ConfigService:_loadFromFile()
-  -- 初始化默认值
-  for k, v in pairs(kDefaultConfig) do
-    self._data[k] = v
-  end
+	for k, v in pairs(DEFAULT_CONFIG) do
+		self._data[k] = v
+	end
 
-  if not self._fsSupported then
-    return -- 不支持文件系统，仅使用内存默认配置
-  end
+	if not self._fsSupported then
+		self._logger:warn("Filesystem unsupported; running with default config only.")
+		return
+	end
 
-  if not isfile(kConfigPath) then
-    return -- 配置文件不存在，首次运行，使用默认值
-  end
+	pcall(function()
+		-- 确保目录存在
+		if not isfolder(CONFIG_DIR) then
+			makefolder(CONFIG_DIR)
+		end
+	end)
 
-  local okRead, content = pcall(readfile, kConfigPath)
-  if not okRead or not content then return end
+	if not isfile(CONFIG_FILE) then return end
 
-  local okParse, parsedData = pcall(HttpService.JSONDecode, HttpService, content)
-  if not okParse or type(parsedData) ~= "table" then return end
+	local okRead, content = pcall(readfile, CONFIG_FILE)
+	if not okRead or type(content) ~= "string" or content == "" then return end
 
-  -- 将解析到的有效配置覆盖默认值
-  for k, v in pairs(parsedData) do
-    self._data[k] = v
-  end
+	local okParse, parsed = pcall(HttpService.JSONDecode, HttpService, content)
+	if not okParse or type(parsed) ~= "table" then
+		self._logger:warn("Config file corrupt; falling back to defaults.")
+		return
+	end
+
+	for k, v in pairs(parsed :: { [string]: any }) do
+		self._data[k] = v
+	end
 end
 
---- 触发防抖写入文件。
+--- 真实单次延迟防抖:每次 set 都取消之前未触发的 timer。
 function ConfigService:_scheduleSave()
-  if not self._fsSupported then return end
+	if not self._fsSupported then return end
 
-  self._savePending = true
-  local currentTime = os.clock()
-  local timeSinceLastSave = currentTime - self._lastSaveTime
+	-- 取消旧的延迟任务,避免累积
+	if self._saveThread then
+		pcall(task.cancel, self._saveThread)
+		self._saveThread = nil
+	end
 
-  if timeSinceLastSave >= kDebounceTime then
-    self:_flushSave()
-  else
-    -- 在防抖时间内，安排延迟写入
-    task.delay(kDebounceTime - timeSinceLastSave, function()
-      if self._savePending then
-        self:_flushSave()
-      end
-    end)
-  end
+	local delay = DEBOUNCE_SECONDS
+	self._saveThread = task.delay(delay, function()
+		self._saveThread = nil
+		local ok, err = pcall(function() self:_flushSave() end)
+		if not ok then
+			self._logger:error("Config write failed: " .. tostring(err))
+		end
+	end)
 end
 
---- 执行实际写入操作。
 function ConfigService:_flushSave()
-  self._savePending = false
-  self._lastSaveTime = os.clock()
+	local okEncode, jsonStr = pcall(HttpService.JSONEncode, HttpService, self._data)
+	if not okEncode or type(jsonStr) ~= "string" then return end
 
-  -- 确保目录存在
-  if not isfolder("ChuScript") then
-    pcall(makefolder, "ChuScript")
-  end
+	pcall(function()
+		if not isfolder(CONFIG_DIR) then makefolder(CONFIG_DIR) end
+	end)
 
-  local okEncode, jsonStr = pcall(HttpService.JSONEncode, HttpService, self._data)
-  if not okEncode then return end
-
-  pcall(writefile, kConfigPath, jsonStr)
+	pcall(writefile, CONFIG_FILE, jsonStr)
 end
 
---- 获取配置项。
--- @param key string
--- @return any
-function ConfigService:get(key)
-  return self._data[key]
+function ConfigService:get(key: string): any
+	return self._data[key]
 end
 
---- 设置配置项并广播变更，触发持久化。
--- @param key string
--- @param value any
-function ConfigService:set(key, value)
-  local oldValue = self._data[key]
-  if oldValue == value then return end
-
-  self._data[key] = value
-  
-  self._bus:publish("ConfigChanged", {
-    key = key,
-    newValue = value,
-    oldValue = oldValue
-  })
-
-  self:_scheduleSave()
+function ConfigService:getAll(): { [string]: any }
+	-- 返回浅拷贝,避免外部篡改内部状态
+	local copy = {}
+	for k, v in pairs(self._data) do
+		copy[k] = v
+	end
+	return copy
 end
 
-return ConfigService
+function ConfigService:set(key: string, value: any)
+	assert(type(key) == "string", "key must be string")
+	if self._data[key] == value then return end
+
+	local oldValue = self._data[key]
+	self._data[key] = value
+
+	self._bus:publish("ConfigChanged", {
+		key = key,
+		oldValue = oldValue,
+		newValue = value,
+	})
+	self:_scheduleSave()
+end
+
+--- 同步立即落盘(用于脚本结束、游戏退出前)。
+function ConfigService:flush()
+	if self._saveThread then
+		pcall(task.cancel, self._saveThread)
+		self._saveThread = nil
+	end
+	self:_flushSave()
+end
+
+return table.freeze(ConfigService)

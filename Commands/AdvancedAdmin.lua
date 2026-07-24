@@ -1,128 +1,97 @@
+--!strict
 --[[
   Module: AdvancedAdminCommands
-  Description: Further admin commands for bans, mutes, server lock, and announcements.
+  Description: ban / mute / server lock / announcement。注意:在客户端执行器中,
+  Kick/ban 只能影响本地进程内的玩家(无法强制服务端踢人)。公告用本地通知。
 ]]
 
 local Players = game:GetService("Players")
 
-return function(cs)
-  local playerService = cs.players
+return function(cs: any)
+	local players = cs.players
+	local notifications = cs.notifications
+	if not players or not notifications then
+		cs.logger:error("AdvancedAdminCommands: cs.players or cs.notifications missing")
+		return
+	end
 
-  local bannedPlayers = {}
-  local mutedPlayers = {}
-  local serverLocked = false
-  local allowedLockBypass = {}
+	local Common = require(script.Parent._Common)
 
-  local function isAdmin(player)
-    return player == Players.LocalPlayer
-  end
+	-- 仅本地执行器视角内的"封禁/静音/锁服"记录
+	local banned: { [Player]: string } = {}
+	local muted: { [Player]: boolean } = {}
+	local serverLocked = false
+	local allowedLockBypass: { [Player]: boolean } = {}
 
-  local function getPlayerByName(name)
-    if not name or name == "" then
-      return nil
-    end
+	local function isAdmin(player)	return player == Players.LocalPlayer end
 
-    for _, player in ipairs(Players:GetPlayers()) do
-      if string.lower(player.Name) == string.lower(name) then
-        return player
-      end
-    end
+	cs:registerCommand("ban", {}, "Bans a player (client-side).", function(args)
+		local target = players:getPlayerByName(args[1]) or players:getTargets(args[1] or "me")[1]
+		if not target then return false, "Target not found." end
+		local reason = table.concat(args, " ", 2)
+		if reason == "" then reason = "Banned by admin" end
+		banned[target] = reason
 
-    return nil
-  end
+		-- 客户端 Kick 仅生效于本地视图(无法真正阻止玩家)
+		local ok = pcall(function() target:Kick("You were banned. Reason: " .. reason) end)
+		if not ok then return false, "Failed to kick target." end
+		return true, ("Banned %s."):format(target.Name)
+	end)
 
-  local function applyToTargets(selector, callback)
-    local targets = playerService:getTargets(selector or "me")
-    if #targets == 0 then
-      return false, "No valid targets found."
-    end
+	cs:registerCommand("unban", {}, "Unban a player (client-side).", function(args)
+		local target = players:getPlayerByName(args[1])
+		if not target then return false, "Target not found." end
+		banned[target] = nil
+		return true, ("Unbanned %s."):format(target.Name)
+	end)
 
-    for _, player in ipairs(targets) do
-      callback(player)
-    end
+	cs:registerCommand("mute", {}, "Mute a player (client-side).", function(args)
+		local target = players:getPlayerByName(args[1]) or players:getTargets(args[1] or "me")[1]
+		if not target then return false, "Target not found." end
+		muted[target] = true
+		return true, ("Muted %s."):format(target.Name)
+	end)
 
-    return true, string.format("Applied to %d player(s).", #targets)
-  end
+	cs:registerCommand("unmute", {}, "Unmute a player.", function(args)
+		local target = players:getPlayerByName(args[1]) or players:getTargets(args[1] or "me")[1]
+		if not target then return false, "Target not found." end
+		muted[target] = nil
+		return true, ("Unmuted %s."):format(target.Name)
+	end)
 
-  cs:registerCommand("ban", {}, "封禁指定玩家", function(args)
-    local target = getPlayerByName(args[1]) or playerService:getTargets(args[1] or "me")[1]
-    if not target then
-      return false, "Target not found."
-    end
+	cs:registerCommand("serverlock", {"lockserver"}, "Lock server against new joiners (client-side).", function()
+		serverLocked = true
+		return true, "Server locked."
+	end)
 
-    local reason = table.concat(args, " ", 2)
-    if reason == "" then
-      reason = "Banned by admin"
-    end
+	cs:registerCommand("serverunlock", {"unlockserver"}, "Unlock server.", function()
+		serverLocked = false
+		return true, "Server unlocked."
+	end)
 
-    bannedPlayers[target] = reason
-    target:Kick("You were banned. Reason: " .. reason)
-    return true, string.format("Banned %s.", target.Name)
-  end)
+	-- 修正:以前的 announce 是反复 Kick 全员,这是 bug;现在改为本地通知 + 日志广播。
+	cs:registerCommand("announce", {"bc", "broadcast"},
+		"Send a local announcement. Use chat for real broadcast.",
+		function(args)
+			local message = table.concat(args, " ")
+			if message == "" then return false, "Usage: announce <message>" end
 
-  cs:registerCommand("unban", {}, "解除封禁", function(args)
-    local target = getPlayerByName(args[1])
-    if not target then
-      return false, "Target not found."
-    end
+			-- 发送一条全局可视化通知 + 输出到 output
+			notifications:Send("Announcement", message, 6, "Info")
+			cs.logger:info("[Announce] " .. message)
+			return true, "Announcement sent."
+		end
+	)
 
-    bannedPlayers[target] = nil
-    return true, string.format("Unbanned %s.", target.Name)
-  end)
-
-  cs:registerCommand("mute", {}, "禁言指定玩家", function(args)
-    local target = getPlayerByName(args[1]) or playerService:getTargets(args[1] or "me")[1]
-    if not target then
-      return false, "Target not found."
-    end
-
-    mutedPlayers[target] = true
-    return true, string.format("Muted %s.", target.Name)
-  end)
-
-  cs:registerCommand("unmute", {}, "解除禁言", function(args)
-    local target = getPlayerByName(args[1]) or playerService:getTargets(args[1] or "me")[1]
-    if not target then
-      return false, "Target not found."
-    end
-
-    mutedPlayers[target] = nil
-    return true, string.format("Unmuted %s.", target.Name)
-  end)
-
-  cs:registerCommand("serverlock", {"lockserver"}, "锁定服务器，禁止新玩家进入", function(args)
-    serverLocked = true
-    return true, "Server locked."
-  end)
-
-  cs:registerCommand("serverunlock", {"unlockserver"}, "解锁服务器", function(args)
-    serverLocked = false
-    return true, "Server unlocked."
-  end)
-
-  cs:registerCommand("announce", {"bc", "broadcast"}, "向所有玩家发送公告", function(args)
-    local message = table.concat(args, " ")
-    if message == "" then
-      return false, "Usage: announce <message>"
-    end
-
-    for _, player in ipairs(Players:GetPlayers()) do
-      if player and player.Parent then
-        player:Kick("Announcement: " .. message)
-      end
-    end
-
-    return true, "Broadcast sent."
-  end)
-
-  Players.PlayerAdded:Connect(function(player)
-    if bannedPlayers[player] then
-      player:Kick("You were banned. Reason: " .. bannedPlayers[player])
-      return
-    end
-
-    if serverLocked and not isAdmin(player) and not allowedLockBypass[player] then
-      player:Kick("Server is locked.")
-    end
-  end)
+	Players.PlayerAdded:Connect(function(player)
+		if banned[player] then
+			pcall(function()
+				player:Kick("You were banned. Reason: " .. banned[player])
+			end)
+			return
+		end
+		if serverLocked and not isAdmin(player) and not allowedLockBypass[player] then
+			pcall(function() player:Kick("Server is locked.") end)
+		end
+	end)
 end

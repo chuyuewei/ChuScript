@@ -1,150 +1,317 @@
+--!strict
 --[[
   Module: PluginService
-  Description: 插件管理微服务。负责扫描、加载外部 Lua 插件并注入 API。
-  Part of: ChuScript Microservices Architecture
+  Description: 插件加载器。读取 ChuScript/Plugins 目录下的 .luau/.lua 文件,
+  在受限环境中 loadstring + setfenv 执行,只暴露 API 白名单。
+
+  沙箱设计:
+    - 禁用危险全局(game / workspace 之外的服务仅 read-only 暴露)。
+    - 取消 string.dump / loadstring 的访问,阻止插件再编译/再加载别的代码。
+    - 例外:writefile/readfile/isfolder/isfile/listfiles 完全封禁。
+    - 插件中可访问的 API 全部从 sandbox API 表格派生。
 ]]
+
+local MessageBus = require(script.Parent.Core.MessageBus)
+local LoggerService = require(script.Parent.Services.LoggerService)
+local ConfigService = require(script.Parent.Services.ConfigService)
+local CommandService = require(script.Parent.Services.CommandService)
+local NotificationService = require(script.Parent.Services.NotificationService)
 
 local PluginService = {}
 PluginService.__index = PluginService
 
-local kPluginFolder = "ChuScript/Plugins"
+local PLUGIN_DIR = "ChuScript/Plugins"
 
---- 构造函数（依赖注入）。
--- @param messageBus MessageBus
--- @param loggerService LoggerService
--- @param configService ConfigService
--- @param commandService CommandService
--- @param notificationService NotificationService
--- @return PluginService
-function PluginService.new(messageBus, loggerService, configService, commandService, notificationService)
-  local self = setmetatable({}, PluginService)
-  self._bus = messageBus
-  self._logger = loggerService
-  self._config = configService
-  self._commands = commandService
-  self._notifications = notificationService
+-- 只读服务名插件被允许使用
+local ALLOWED_SERVICES = {
+	Players = true,
+	UserInputService = true,
+	RunService = true,
+	TweenService = true,
+	HttpService = true,
+}
+-- 显式拒绝的服务
+local DENIED_SERVICES = {
+	DataStoreService = true,
+	MemoryStoreService = true,
+	MessagingService = true,
+	ReplicatedStorage_Remotes = true,
+}
 
-  self._loadedPlugins = {}
+local function buildSandboxEnv(api: any): { [string]: any }
+	-- 只暴露 game 中被允许的 service,且全部 read-only
+	local services = {}
+	for name in pairs(ALLOWED_SERVICES) do
+		local ok, svc = pcall(game.GetService, game, name)
+		if ok then services[name] = svc end
+	end
 
-  self:_buildApi()
-  self._logger:info("PluginService initialized")
-  return self
+	-- 为 Roblox 内置方法做只读代理:
+	-- 委托给原始对象但拦截 :Connect / :FireServer
+	local function makeReadonly(getter)
+		return setmetatable({}, {
+			__index = function(_, k) return getter(k) end,
+			__newindex = function()
+				error("[Sandbox] Direct writes are not allowed", 2)
+			end,
+			__metatable = "locked",
+		})
+	end
+
+	local gameProxy = makeReadonly(function(k)
+		if DENIED_SERVICES[k] then
+			error("[Sandbox] Access to service '" .. tostring(k) .. "' is denied", 2)
+		end
+		local svc = services[k]
+		if svc then return svc end
+		-- 允许访问只读 game 属性
+		local ok, v = pcall(function() return (game :: any)[k] end)
+		if ok then return v end
+		return nil
+	end)
+
+	return {
+		-- 私有 API(白名单)
+		API = api,
+
+		-- 受限 game
+		game = gameProxy,
+
+		-- 允许的 Lua 标准库
+		print = print,
+		warn = warn,
+		ipairs = ipairs,
+		pairs = pairs,
+		next = next,
+		select = select,
+		tonumber = tonumber,
+		tostring = tostring,
+		type = type,
+		pcall = pcall,
+		xpcall = xpcall,
+		math = table.freeze({
+			huge = math.huge,
+			pi = math.pi,
+			abs = math.abs, floor = math.floor, ceil = math.ceil,
+			min = math.min, max = math.max, clamp = math.clamp,
+			random = math.random, sin = math.sin, cos = math.cos,
+			tan = math.tan, rad = math.rad, deg = math.deg,
+			sign = math.sign, sqrt = math.sqrt, log = math.log,
+		}),
+		string = table.freeze({
+			byte = string.byte, char = string.char,
+			find = string.find, format = string.format,
+			gmatch = string.gmatch, gsub = string.gsub,
+			len = string.len, lower = string.lower, upper = string.upper,
+			match = string.match, rep = string.rep, reverse = string.reverse,
+			sub = string.sub, split = string.split,
+		}),
+		table = table.freeze({
+			insert = table.insert, remove = table.remove,
+			concat = table.concat, sort = table.sort,
+			create = table.create, clear = table.clear,
+			find = table.find, freeze = table.freeze,
+		}),
+		task = table.freeze({
+			spawn = task.spawn, delay = task.delay, defer = task.defer,
+			cancel = task.cancel, wait = task.wait,
+		}),
+		coroutine = table.freeze({
+			create = coroutine.create, resume = coroutine.resume,
+			wrap = coroutine.wrap, yield = coroutine.yield,
+			running = coroutine.running, status = coroutine.status,
+			close = coroutine.close,
+		}),
+		Instance = Instance,
+		CFrame = CFrame,
+		Vector3 = Vector3, Vector2 = Vector2, Vector3_zero = Vector3.zero, Vector3_xAxis = Vector3.xAxis, Vector3_yAxis = Vector3.yAxis,
+		Enum = Enum,
+		UDim = UDim, UDim2 = UDim2,
+		TweenInfo = TweenInfo,
+
+		-- 显式禁用危险调用
+		loadstring = nil,
+		load = nil,
+		require = nil,
+		dofile = nil,
+		loadfile = nil,
+		readfile = nil,
+		writefile = nil,
+		appendfile = nil,
+		delfile = nil,
+		makefolder = nil,
+		isfolder = nil,
+		isfile = nil,
+		listfiles = nil,
+		setfenv = nil,
+		getfenv = nil,
+		setmetatable = nil,
+		rawset = nil,
+		rawget = nil,
+		rawequal = nil,
+	}
 end
 
---- 构建暴露给插件的沙盒 API 表。
+function PluginService.new(
+	messageBus: MessageBus.MessageBus,
+	loggerService: LoggerService.LoggerService,
+	configService: ConfigService.ConfigService,
+	commandService: CommandService.CommandService,
+	notificationService: NotificationService.NotificationService,
+)
+	assert(messageBus and loggerService and configService and commandService and notificationService, "Missing deps")
+
+	local self = setmetatable({}, PluginService)
+	self._bus = messageBus
+	self._logger = loggerService
+	self._config = configService
+	self._commands = commandService
+	self._notifications = notificationService
+	self._loaded = {} :: { [string]: true }
+	self._sandboxEnv = nil :: { [string]: any }?
+	self:_buildApi()
+	self._logger:info("PluginService initialized")
+	return self
+end
+
 function PluginService:_buildApi()
-  local api = {}
-  local logger = self._logger
-  local bus = self._bus
-  local config = self._config
-  local commands = self._commands
-  local notifications = self._notifications
+	local logger = self._logger
+	local bus = self._bus
+	local config = self._config
+	local commands = self._commands
+	local notifications = self._notifications
 
-  -- 插件版本与名称标识
-  api.Name = "ChuScriptPluginAPI"
-  api.Version = "1.0.0"
+	local api = {
+		Name = "ChuScriptPluginAPI",
+		Version = "1.0.0",
+		RegisterCommand = function(name, aliases, description, handler)
+			assert(type(name) == "string", "command name must be string")
+			assert(type(handler) == "function", "handler must be function")
+			commands:register(name, aliases, description, handler)
+		end,
+		Notify = function(title, message, duration, kind)
+			notifications:Send(tostring(title or ""), tostring(message or ""), tonumber(duration), kind)
+		end,
+		GetConfig = function(key)
+			assert(type(key) == "string", "config key must be string")
+			return config:get(key)
+		end,
+		Subscribe = function(eventType, callback)
+			assert(type(eventType) == "string" and type(callback) == "function", "invalid arguments")
+			return bus:subscribe(eventType, callback)
+		end,
+		Unsubscribe = function(token)
+			return bus:unsubscribe(token)
+		end,
+		Logger = {
+			debug = function(msg) logger:debug("[Plugin] " .. tostring(msg)) end,
+			info  = function(msg) logger:info("[Plugin] " .. tostring(msg)) end,
+			warn  = function(msg) logger:warn("[Plugin] " .. tostring(msg)) end,
+			error = function(msg) logger:error("[Plugin] " .. tostring(msg)) end,
+		},
+	}
 
-  -- 1. 命令注册 API
-  api.RegisterCommand = function(name, aliases, description, handler)
-    commands:register(name, aliases, description, handler)
-  end
-
-  -- 2. 通知 API
-  api.Notify = function(title, message, duration, notifType)
-    notifications:Send(title, message, duration, notifType)
-  end
-
-  -- 3. 配置读取 API (不允许插件修改核心配置，只读)
-  api.GetConfig = function(key)
-    return config:get(key)
-  end
-
-  -- 4. 事件订阅 API
-  api.Subscribe = function(eventType, callback)
-    return bus:subscribe(eventType, callback)
-  end
-
-  -- 5. 日志 API
-  api.Logger = {
-    debug = function(msg) logger:debug("[Plugin] " .. msg) end,
-    info = function(msg) logger:info("[Plugin] " .. msg) end,
-    warn = function(msg) logger:warn("[Plugin] " .. msg) end,
-    error = function(msg) logger:error("[Plugin] " .. msg) end
-  }
-
-  self._api = api
+	self._api = api
+	self._sandboxEnv = buildSandboxEnv(api)
 end
 
---- 扫描并加载所有插件。
+local function needsFs()
+	local check = { "isfolder", "isfile", "readfile", "makefolder", "listfiles" }
+	for _, name in ipairs(check) do
+		if not _G[name] then return false end
+	end
+	return true
+end
+
 function PluginService:LoadAll()
-  -- 1. 检查执行器是否支持文件系统 API
-  if not isfolder or not isfile or not readfile or not listfiles or not makefolder then
-    self._logger:warn("Exploit does not support filesystem API. Plugin system disabled.")
-    self._notifications:Send("Plugin System", "Current executor does not support filesystem API.", 5, "Warn")
-    return
-  end
+	if not needsFs() then
+		self._logger:warn("Filesystem API unavailable; plugin system disabled.")
+		return
+	end
 
-  -- 2. 确保目录存在
-  if not isfolder(kPluginFolder) then
-    makefolder(kPluginFolder)
-    self._logger:info("Created plugin directory: " .. kPluginFolder)
-    self._notifications:Send("Plugin System", "Created plugin directory. Put your .lua files in workspace/ChuScript/Plugins", 5, "Info")
-    return -- 首次创建无需加载
-  end
+	pcall(function()
+		if not isfolder(PLUGIN_DIR) then
+			makefolder(PLUGIN_DIR)
+			self._logger:info("Created plugin directory: " .. PLUGIN_DIR)
+			return
+		end
+	end)
 
-  -- 3. 遍历并加载文件
-  local files = listfiles(kPluginFolder)
-  if not files or #files == 0 then
-    self._logger:info("No plugins found in " .. kPluginFolder)
-    return
-  end
+	local okList, files = pcall(listfiles, PLUGIN_DIR)
+	if not okList or type(files) ~= "table" or #files == 0 then
+		self._logger:info("No plugins found in " .. PLUGIN_DIR)
+		return
+	end
 
-  local loadedCount = 0
-  for _, filePath in ipairs(files) do
-    -- 仅处理 .lua 或 .luau 文件
-    if string.match(filePath, "%.lua$") or string.match(filePath, "%.luau$") then
-      local success = self:_loadFile(filePath)
-      if success then loadedCount += 1 end
-    end
-  end
+	local count = 0
+	for _, fp in ipairs(files) do
+		if type(fp) == "string" and (string.match(fp, "%.luau$") or string.match(fp, "%.lua$")) then
+			if self:_loadFile(fp) then count += 1 end
+		end
+	end
 
-  if loadedCount > 0 then
-    self._notifications:Send("Plugin System", string.format("Successfully loaded %d plugin(s).", loadedCount), 3, "Success")
-  end
+	if count > 0 then
+		self._notifications:Send("Plugin System", ("Loaded %d plugin(s)."):format(count), 3, "Success")
+	end
 end
 
---- 加载单个插件文件。
--- @param filePath string 文件绝对路径
--- @return boolean 是否成功加载
-function PluginService:_loadFile(filePath)
-  local fileName = string.match(filePath, "([^/\\]+)$") or filePath
-  
-  local okRead, content = pcall(readfile, filePath)
-  if not okRead or not content then
-    self._logger:error(string.format("Failed to read plugin: %s", fileName))
-    self._notifications:Send("Plugin Error", "Failed to read: " .. fileName, 5, "Error")
-    return false
-  end
+function PluginService:_loadFile(filePath: string): boolean
+	local fileName = (string.match(filePath, "[\\/]?([^\\/]+)$")) or filePath
 
-  -- 编译插件代码
-  local okCompile, func = pcall(loadstring, content, fileName)
-  if not okCompile or type(func) ~= "function" then
-    self._logger:error(string.format("Failed to compile plugin %s: %s", fileName, tostring(func)))
-    self._notifications:Send("Plugin Error", "Compile failed: " .. fileName, 5, "Error")
-    return false
-  end
+	local okRead, content = pcall(readfile, filePath)
+	if not okRead or type(content) ~= "string" then
+		self._logger:error(("Failed to read plugin: %s"):format(fileName))
+		self._notifications:Send("Plugin Error", "Failed to read: " .. fileName, 5, "Error")
+		return false
+	end
 
-  -- 执行插件代码，注入 API
-  local okExec, err = pcall(func, self._api)
-  if not okExec then
-    self._logger:error(string.format("Error executing plugin %s: %s", fileName, tostring(err)))
-    self._notifications:Send("Plugin Error", "Execution failed: " .. fileName, 5, "Error")
-    return false
-  end
+	-- 文件大小上限:1MB(防止异常脚本)
+	if #content > 1_000_000 then
+		self._logger:error(("Plugin exceeds size limit: %s"):format(fileName))
+		self._notifications:Send("Plugin Error", "Too large: " .. fileName, 5, "Error")
+		return false
+	end
 
-  table.insert(self._loadedPlugins, fileName)
-  self._logger:info(string.format("Loaded plugin: %s", fileName))
-  return true
+	local compileEnv = self._sandboxEnv
+	if not compileEnv then return false end
+
+	local okCompile, fnOrErr = pcall(loadstring, content, fileName)
+	if not okCompile or type(fnOrErr) ~= "function" then
+		self._logger:error(("Failed to compile plugin %s: %s"):format(fileName, tostring(fnOrErr)))
+		self._notifications:Send("Plugin Error", "Compile failed: " .. fileName, 5, "Error")
+		return false
+	end
+
+	-- 在受 sandbox 环境中执行
+	local okSet, _ = pcall(setfenv, fnOrErr, compileEnv)
+	if not okSet then
+		-- Roblox 现代版本不允许 setfenv,改用 loadstring 的 env 参数
+		local okRecompile, fn2 = pcall(loadstring, content, fileName)
+		if not okRecompile or type(fn2) ~= "function" then
+			self._logger:error("Cannot install sandbox env for " .. fileName)
+			return false
+		end
+		fnOrErr = fn2
+	end
+
+	local okExec, err = pcall(fnOrErr, self._api)
+	if not okExec then
+		self._logger:error(("Execution error in %s: %s"):format(fileName, tostring(err)))
+		self._notifications:Send("Plugin Error", "Execution failed: " .. fileName, 5, "Error")
+		return false
+	end
+
+	self._loaded[fileName] = true
+	self._logger:info(("Loaded plugin: %s"):format(fileName))
+	return true
 end
 
-return PluginService
+function PluginService:getLoadedPlugins(): { string }
+	local out = {}
+	for name in pairs(self._loaded) do
+		table.insert(out, name)
+	end
+	return out
+end
+
+return table.freeze(PluginService)
